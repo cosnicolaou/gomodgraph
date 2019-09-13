@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"sort"
@@ -38,6 +39,8 @@ var graphQueryCmd = &cobra.Command{
 
 type graphStateDef struct {
 	Versioned    bool   `graph:"versioned,false,'if set, module versions are tracked'"`
+	DotFormat    string `dot:"format,,set to a dot output format to run dot internally to generate that format"`
+	DotCommand   string `dot:"command,sfdp,command to run to process dot script"`
 	Start        string `query:"start,,module to start dependency analysis"`
 	Dependencies bool   `query:"dependencies,true,set to false to trace dependents rather than dependencies"`
 	Contains     string `query:"contains,,specify a module to be found in the dependencie or dependent module paths"`
@@ -51,6 +54,7 @@ func init() {
 	graphCmd.AddCommand(graphQueryCmd)
 
 	must(pflagvar.RegisterFlagsInStruct(graphDotCmd.Flags(), "graph", &graphState, nil, nil))
+	must(pflagvar.RegisterFlagsInStruct(graphDotCmd.Flags(), "dot", &graphState, nil, nil))
 	must(pflagvar.RegisterFlagsInStruct(graphQueryCmd.Flags(), "graph", &graphState, nil, nil))
 	must(pflagvar.RegisterFlagsInStruct(graphQueryCmd.Flags(), "query", &graphState, nil, nil))
 }
@@ -70,14 +74,15 @@ func getRoot(ctx context.Context) (string, error) {
 	return strings.TrimSuffix(string(output), "\n"), nil
 }
 
-func getGraph(ctx context.Context, versioned bool) ([]dependency, map[string]bool, error) {
+func getGraph(ctx context.Context, versioned bool) ([]dependency, map[string]bool, []string, error) {
 	// Use go mod graph to get the raw dependencies.
+	ordered := []string{}
 	buf := bytes.NewBuffer(nil)
 	cmd := exec.CommandContext(ctx, "go", "mod", "graph")
 	cmd.Stderr = buf
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to run `go mod graph`: %v: %v", buf.String(), err)
+		return nil, nil, nil, fmt.Errorf("failed to run `go mod graph`: %v: %v", buf.String(), err)
 	}
 
 	scanOutput := func(fn func(a, b string)) error {
@@ -96,11 +101,16 @@ func getGraph(ctx context.Context, versioned bool) ([]dependency, map[string]boo
 
 	dependencies := []dependency{}
 	unique := map[string]bool{}
+	dupOrdered := []string{}
 	if !versioned {
 		// strip all versions and dedup.
 		deduped := map[string]bool{}
 		err = scanOutput(func(mod, dep string) {
-			deduped[stripVersion(mod)+" "+stripVersion(dep)] = true
+			mod = stripVersion(mod)
+			dep = stripVersion(dep)
+			deduped[mod+" "+dep] = true
+			dupOrdered = append(dupOrdered, mod)
+			dupOrdered = append(dupOrdered, dep)
 		})
 		for k := range deduped {
 			parts := strings.Split(k, " ")
@@ -109,17 +119,30 @@ func getGraph(ctx context.Context, versioned bool) ([]dependency, map[string]boo
 			unique[dep] = true
 			dependencies = append(dependencies, dependency{Module: mod, DependsOn: dep})
 		}
+		dedup := map[string]bool{}
+		for _, m := range dupOrdered {
+			if !dedup[m] {
+				ordered = append(ordered, m)
+			}
+			dedup[m] = true
+		}
 	} else {
 		err = scanOutput(func(mod, dep string) {
+			if _, ok := unique[mod]; !ok {
+				ordered = append(ordered, mod)
+			}
+			if _, ok := unique[dep]; !ok {
+				ordered = append(ordered, dep)
+			}
 			unique[mod] = true
 			unique[dep] = true
 			dependencies = append(dependencies, dependency{Module: mod, DependsOn: dep})
 		})
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return dependencies, unique, nil
+	return dependencies, unique, ordered, nil
 }
 
 func stripVersion(m string) string {
@@ -146,7 +169,7 @@ func graphDot(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	dependencies, _, err := getGraph(ctx, graphState.Versioned)
+	dependencies, _, _, err := getGraph(ctx, graphState.Versioned)
 	if err != nil {
 		return err
 	}
@@ -157,7 +180,32 @@ func graphDot(cmd *cobra.Command, args []string) error {
 		Root:         root,
 		Dependencies: dependencies,
 	}
-	return graphDotTpl.Execute(os.Stdout, &graph)
+	format := graphState.DotFormat
+	if len(format) == 0 {
+		// output raw dot format
+		return graphDotTpl.Execute(os.Stdout, &graph)
+	}
+
+	writeDotFile := func() (string, error) {
+		tmpfile, err := ioutil.TempFile("", "dot-*.dot")
+		if err != nil {
+			return "", err
+		}
+		defer tmpfile.Close()
+		if err := graphDotTpl.Execute(tmpfile, &graph); err != nil {
+			os.Remove(tmpfile.Name())
+			return tmpfile.Name(), err
+		}
+		return tmpfile.Name(), nil
+	}
+	name, err := writeDotFile()
+	if err != nil {
+		return err
+	}
+	defer os.Remove(name)
+	dotcmd := exec.CommandContext(ctx, graphState.DotCommand, "-T"+format, name)
+	dotcmd.Stdout = os.Stdout
+	return dotcmd.Run()
 }
 
 type graphNode struct {
@@ -194,70 +242,77 @@ func buildGraph(dependencies []dependency, unique map[string]bool) (*graph, erro
 }
 
 type treeNode struct {
-	module   string
-	children map[string]*treeNode
+	Module   string
+	Cycle    string
+	Children map[string]*treeNode
 }
 
 // given a starting point, create a tree of dependencies from it, taking
 // care to detect cycles.
 func (gr *graph) dependencyTree(c *treeNode) map[string]*treeNode {
-	return gr.flatten(c, func(gn *graphNode) []*graphNode {
+	r, _ := gr.flatten(c, func(gn *graphNode) []*graphNode {
 		sort.Slice(gn.dependencies, func(i, j int) bool {
 			return gn.dependencies[i].module < gn.dependencies[j].module
 		})
 		return gn.dependencies
 	}, map[string]bool{})
+	return r
 }
 
 // given a starting point, create a tree of dependents from it, taking
 // care to detect cycles.
 func (gr *graph) dependentTree(c *treeNode) map[string]*treeNode {
-	return gr.flatten(c, func(gn *graphNode) []*graphNode {
+	r, _ := gr.flatten(c, func(gn *graphNode) []*graphNode {
 		sort.Slice(gn.dependents, func(i, j int) bool {
 			return gn.dependents[i].module < gn.dependents[j].module
 		})
 		return gn.dependents
 	}, map[string]bool{})
+	return r
 }
 
-func (gr *graph) flatten(c *treeNode, follow func(gn *graphNode) []*graphNode, visited map[string]bool) map[string]*treeNode {
-	gn := gr.nodes[c.module]
-	if gn == nil || visited[c.module] {
-		return nil
+func (gr *graph) flatten(c *treeNode, follow func(gn *graphNode) []*graphNode, visited map[string]bool) (map[string]*treeNode, bool) {
+	gn := gr.nodes[c.Module]
+	if cycle := visited[c.Module]; gn == nil || cycle {
+		// detected a cycle
+		return nil, true
 	}
-	visited[c.module] = true
-	c.children = map[string]*treeNode{}
+	visited[c.Module] = true
+	c.Children = map[string]*treeNode{}
 	for _, dep := range follow(gn) {
-		dt := &treeNode{module: dep.module}
-		sdeps := gr.flatten(dt, follow, visited)
-		for k, v := range sdeps {
-			dt.children[k] = v
+		dt := &treeNode{Module: dep.module}
+		sdeps, cycle := gr.flatten(dt, follow, visited)
+		if cycle {
+			c.Cycle = dt.Module
 		}
-		c.children[dep.module] = dt
+		for k, v := range sdeps {
+			dt.Children[k] = v
+		}
+		c.Children[dep.module] = dt
 	}
-	return c.children
+	return c.Children, false
 }
 
 func filter(dt *treeNode, match func(tn *treeNode) bool, matched bool) *treeNode {
-	mod := &treeNode{module: dt.module}
+	mod := &treeNode{Module: dt.Module}
 	matched = matched || match(dt)
 	if matched {
 		// should probably copy the subtree for easier maintenance in the
 		// future.
-		mod.children = dt.children
+		mod.Children = dt.Children
 		return mod
 	}
-	if len(dt.children) == 0 {
+	if len(dt.Children) == 0 {
 		// we're done, drop this path altogether.
 		return nil
 	}
-	mod.children = map[string]*treeNode{}
-	for k, v := range dt.children {
+	mod.Children = map[string]*treeNode{}
+	for k, v := range dt.Children {
 		if m := filter(v, match, matched); m != nil {
-			mod.children[k] = m
+			mod.Children[k] = m
 		}
 	}
-	if len(mod.children) == 0 {
+	if len(mod.Children) == 0 {
 		return nil
 	}
 	return mod
@@ -267,49 +322,58 @@ func (dt *treeNode) print(depth int) {
 	if dt == nil {
 		return
 	}
-	fmt.Printf("%v%v\n", strings.Repeat(" ", depth*2), dt.module)
-	children := make([]string, 0, len(dt.children))
-	for c := range dt.children {
+	if cycle := dt.Cycle; len(cycle) > 0 {
+		fmt.Printf("%v%v (cycle -> %v)\n", strings.Repeat(" ", depth*2), dt.Module, cycle)
+	} else {
+		fmt.Printf("%v%v\n", strings.Repeat(" ", depth*2), dt.Module)
+	}
+	children := make([]string, 0, len(dt.Children))
+	for c := range dt.Children {
 		children = append(children, c)
 	}
 	sort.Strings(children)
 	for _, c := range children {
-		dt.children[c].print(depth + 1)
+		dt.Children[c].print(depth + 1)
 	}
+}
+
+func runQuery(ctx context.Context, start, contains string, versioned bool) (*treeNode, error) {
+	if len(start) == 0 {
+		root, err := getRoot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		start = root
+	}
+	dependencies, unique, _, err := getGraph(ctx, versioned)
+	if err != nil {
+		return nil, err
+	}
+	graph, err := buildGraph(dependencies, unique)
+	if err != nil {
+		return nil, err
+	}
+	dt := &treeNode{Module: start}
+	if graphState.Dependencies {
+		dt.Children = graph.dependencyTree(dt)
+	} else {
+		dt.Children = graph.dependentTree(dt)
+	}
+	if contains := graphState.Contains; len(contains) > 0 {
+		filtered := filter(dt, func(tn *treeNode) bool {
+			return tn.Module == contains
+		}, false)
+		return filtered, nil
+	}
+	return dt, nil
 }
 
 func graphQuery(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
-	start := graphState.Start
-	if len(start) == 0 {
-		root, err := getRoot(ctx)
-		if err != nil {
-			return err
-		}
-		start = root
-	}
-
-	dependencies, unique, err := getGraph(ctx, graphState.Versioned)
+	tree, err := runQuery(ctx, graphState.Start, graphState.Contains, graphState.Versioned)
 	if err != nil {
 		return err
 	}
-	graph, err := buildGraph(dependencies, unique)
-	if err != nil {
-		return err
-	}
-	dt := &treeNode{module: start}
-	if graphState.Dependencies {
-		dt.children = graph.dependencyTree(dt)
-	} else {
-		dt.children = graph.dependentTree(dt)
-	}
-	if contains := graphState.Contains; len(contains) > 0 {
-		filtered := filter(dt, func(tn *treeNode) bool {
-			return tn.module == contains
-		}, false)
-		filtered.print(0)
-		return nil
-	}
-	dt.print(0)
+	tree.print(0)
 	return nil
 }
