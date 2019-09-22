@@ -1,6 +1,6 @@
-# godep
+# gomodgraph
 
-godep provides support for understanding go dependencies. The
+gomodgraph provides support for understanding go dependencies. The
 current sub commands are:
 
 ## graph
@@ -14,6 +14,10 @@ is given a starting point all dependencies or all dependents
 can be enumerated as a tree (with cycles detected). The
 flattened trees can be queried for the presence of a given
 module.
+3. the graph can be visualized in a browser as either
+a dependency wheel or an interactive tree. Both are
+initial prototypes at the moment but still useful, especially
+the interactive tree since it supports pan/zoom and collapsing.
 
 ## examples
 
@@ -21,8 +25,8 @@ module.
 Dot graph of all dependencies for the current module:
 ```sh
 go run github.com/cosnicolaou/godep graph --dot . > mymodule.dot
+sfdp -Tpdf -o mymodule.pdf mymodule.dot
 ```
-
 
 Simple display of dependency hierarchy:
 ```sh
@@ -49,7 +53,12 @@ Find all dependents that use golang.org/x/tools which occur on a path that inclu
 go run github.com/cosnicolaou/godep graph query --dependencies=false --start=golang.org/x/tools --contains=google.golang.org/grpc
 ```
 
+Several visualizations are available, including a dependency wheel, code flower and ...
 
+```sh
+go run . graph dependency-wheel > dep-well.html && open dep-well.html
+go run . graph itree > interactive-tree.html && open interactive-tree.html
+```
 
 ## TODO
 1. add a command to display detected cycles rather than just
